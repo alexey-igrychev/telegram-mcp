@@ -119,6 +119,7 @@ async def enable_forum(chat_id: Union[int, str], account: Optional[str] = None) 
 )
 @with_account(readonly=False)
 @validate_id("chat_id")
+@flood_category("admin_action")
 async def create_topic(chat_id: Union[int, str], title: str, account: Optional[str] = None) -> str:
     """Create a topic in a forum-enabled supergroup, subject to Telegram permissions.
 
