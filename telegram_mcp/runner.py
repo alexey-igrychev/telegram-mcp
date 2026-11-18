@@ -218,6 +218,46 @@ def _configure_transport_security() -> None:
     )
 
 
+async def _serve_private_http(token_file: str) -> None:
+    """Serve authenticated Streamable HTTP on the loopback interface."""
+    from hmac import compare_digest
+    from pathlib import Path
+
+    import uvicorn
+    from starlette.responses import Response
+
+    if mcp.settings.host != "127.0.0.1":
+        raise ValueError("Private Telegram MCP requires MCP_HOST=127.0.0.1")
+    token = Path(token_file).read_bytes().strip()
+    if len(token) != 64 or any(byte not in b"0123456789abcdef" for byte in token):
+        raise ValueError("Invalid Telegram MCP bearer token file")
+    expected = b"Bearer " + token
+
+    # Keep separate MCP sessions so the server can request each client's roots.
+    mcp.settings.stateless_http = False
+    app = mcp.streamable_http_app()
+
+    async def authenticated(scope, receive, send):
+        if scope["type"] == "http":
+            headers = [value for name, value in scope["headers"] if name == b"authorization"]
+            if len(headers) != 1 or not compare_digest(headers[0], expected):
+                await Response(status_code=401, headers={"WWW-Authenticate": "Bearer"})(
+                    scope, receive, send
+                )
+                return
+        await app(scope, receive, send)
+
+    config = uvicorn.Config(
+        authenticated,
+        host=mcp.settings.host,
+        port=mcp.settings.port,
+        log_level=mcp.settings.log_level.lower(),
+        access_log=False,
+        timeout_graceful_shutdown=10,
+    )
+    await uvicorn.Server(config).serve()
+
+
 async def _serve(transport: str) -> None:
     """Run the MCP server on the selected transport.
 
@@ -228,11 +268,16 @@ async def _serve(transport: str) -> None:
     that Claude Code (`--transport http`) and Codex (`--url`) speak natively;
     "sse" is kept for clients that only support the legacy SSE transport.
     """
+    token_file = os.getenv("MCP_HTTP_BEARER_TOKEN_FILE")
+    if token_file and transport != "http":
+        raise ValueError("MCP_HTTP_BEARER_TOKEN_FILE requires Streamable HTTP")
     if transport in ("http", "sse"):
         mcp.settings.host = os.getenv("MCP_HOST", "127.0.0.1")
         mcp.settings.port = int(os.getenv("MCP_PORT", "8765"))
         _configure_transport_security()
-        if transport == "http":
+        if token_file:
+            await _serve_private_http(token_file)
+        elif transport == "http":
             await mcp.run_streamable_http_async()
         else:
             await mcp.run_sse_async()
@@ -373,6 +418,13 @@ def main() -> None:
     _transcription.validate_transcription_config()
     _session_lock_shared()  # fail loudly at startup on a bad toggle
     asyncio.run(_main())
+
+
+def main_private_http() -> None:
+    if not os.getenv("MCP_HTTP_BEARER_TOKEN_FILE"):
+        raise SystemExit("MCP_HTTP_BEARER_TOKEN_FILE is required for private HTTP")
+    os.environ["MCP_TRANSPORT"] = "http"
+    main()
 
 
 if __name__ == "__main__":
