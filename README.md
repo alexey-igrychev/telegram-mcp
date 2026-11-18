@@ -1105,3 +1105,9 @@ Maintained by [@chigwell](https://github.com/chigwell) and [@l1v0n1](https://git
 <a href="https://github.com/chigwell/telegram-mcp/graphs/contributors">
   <img src="https://contrib.rocks/image?repo=chigwell/telegram-mcp" />
 </a>
+
+## Local compatibility tools
+
+This installation preserves `enable_forum` and `create_topic`, including UTF-8 title validation and matching the created topic ID to its request. `list_topics` uses the current Telethon messages API. `vote_poll` is provided by upstream.
+
+`get_chat_notification_settings` reads chat-wide effective mute state without message history. `get_chats`, `list_chats`, and `get_chat` also include `muted`, `mute_until`, `peer_mute_until`, and `source`. Missing per-chat settings inherit category defaults; explicit zero overrides them. Unknown or failed settings stay unknown. List calls cache category defaults per call. `unmuted_only` includes only confirmed unmuted chats.

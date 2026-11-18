@@ -14,6 +14,142 @@ from telegram_mcp.tools.messages import in_allowed_topics, topic_thread_kwargs
 LAST_MESSAGE_TOPIC_WINDOW = 20
 
 
+async def chat_notification_settings(entity, cl, settings=None, defaults=None):
+    """Read effective server mute state; never fetch messages or alter notifications."""
+    result = {"muted": None, "mute_until": None, "peer_mute_until": None, "source": "unknown"}
+    try:
+        if settings is None:
+            peer = await cl.get_input_entity(entity)
+            settings = await cl(
+                functions.account.GetNotifySettingsRequest(types.InputNotifyPeer(peer))
+            )
+        until = settings.mute_until
+        result["peer_mute_until"] = (
+            int(until.timestamp()) if isinstance(until, datetime) else until
+        )
+        result["source"] = "chat"
+        if until is None:
+            if isinstance(entity, User):
+                scope, peer = "users", types.InputNotifyUsers()
+            elif isinstance(entity, Channel) and entity.broadcast:
+                scope, peer = "broadcasts", types.InputNotifyBroadcasts()
+            else:
+                scope, peer = "groups", types.InputNotifyChats()
+            result["source"] = f"default:{scope}"
+            if defaults is None:
+                defaults = {}
+            if scope not in defaults:
+                try:
+                    defaults[scope] = await cl(functions.account.GetNotifySettingsRequest(peer))
+                except Exception as error:
+                    defaults[scope] = error
+            if isinstance(defaults[scope], Exception):
+                raise defaults[scope]
+            until = defaults[scope].mute_until
+        timestamp = int(until.timestamp()) if isinstance(until, datetime) else until
+        result["mute_until"] = timestamp
+        if timestamp is not None:
+            result["muted"] = timestamp > time.time()
+        return result
+    except Exception as error:
+        result["error"] = type(error).__name__
+        return result
+
+
+@mcp.tool(
+    annotations=ToolAnnotations(
+        title="Get Chat Notification Settings", openWorldHint=True, readOnlyHint=True
+    )
+)
+@with_account(readonly=True)
+@validate_id("chat_id")
+async def get_chat_notification_settings(
+    chat_id: Union[int, str], account: Optional[str] = None
+) -> str:
+    """Read server mute state as JSON without message history. muted=null means unknown.
+
+    Includes effective/peer mute_until (Unix seconds) and source (chat/default category).
+    This is chat-wide state; local device and individual forum-topic settings are not covered.
+    """
+    try:
+        cl = get_client(account)
+        entity = await resolve_entity(chat_id, cl)
+        settings = await chat_notification_settings(entity, cl)
+        return json.dumps({"chat_id": utils.get_peer_id(entity), **settings}, ensure_ascii=False)
+    except Exception as error:
+        return log_and_format_error("get_chat_notification_settings", error, chat_id=chat_id)
+
+
+@mcp.tool(
+    annotations=ToolAnnotations(
+        title="Enable Forum",
+        openWorldHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+    )
+)
+@with_account(readonly=False)
+@validate_id("chat_id")
+async def enable_forum(chat_id: Union[int, str], account: Optional[str] = None) -> str:
+    """Enable forum topics in an existing supergroup. Requires Telegram admin rights.
+
+    Args:
+        chat_id: The ID or username of the supergroup.
+    """
+    try:
+        cl = get_client(account)
+        entity = await resolve_entity(chat_id, cl)
+        if not isinstance(entity, Channel) or not entity.megagroup:
+            return "The specified chat is not a supergroup."
+        if entity.forum:
+            return "Forum topics are already enabled."
+        await cl(functions.channels.ToggleForumRequest(channel=entity, enabled=True, tabs=False))
+        return f"Forum topics enabled in chat {chat_id}."
+    except Exception as e:
+        return log_and_format_error("enable_forum", e, chat_id=chat_id)
+
+
+@mcp.tool(
+    annotations=ToolAnnotations(
+        title="Create Topic",
+        openWorldHint=True,
+        destructiveHint=False,
+        idempotentHint=False,
+    )
+)
+@with_account(readonly=False)
+@validate_id("chat_id")
+async def create_topic(chat_id: Union[int, str], title: str, account: Optional[str] = None) -> str:
+    """Create a topic in a forum-enabled supergroup, subject to Telegram permissions.
+
+    Call enable_forum first if topics are disabled. Each call creates a new topic,
+    even if the title already exists. Use list_topics before retrying an uncertain result.
+
+    Args:
+        chat_id: The ID or username of the supergroup.
+        title: Non-blank topic title, at most 128 UTF-8 bytes.
+
+    The returned topic ID can be used as message_id in reply_to_message.
+    """
+    try:
+        if not title.strip() or len(title.encode("utf-8")) > 128:
+            return "Error: title must be non-blank and at most 128 UTF-8 bytes."
+        cl = get_client(account)
+        entity = await resolve_entity(chat_id, cl)
+        if not isinstance(entity, Channel) or not entity.megagroup:
+            return "The specified chat is not a supergroup."
+        if not entity.forum:
+            return "Forum topics are disabled. Call enable_forum first."
+        request = functions.messages.CreateForumTopicRequest(peer=entity, title=title)
+        result = await cl(request)
+        for update in getattr(result, "updates", []):
+            if isinstance(update, types.UpdateMessageID) and update.random_id == request.random_id:
+                return f"Topic '{title}' created with ID: {update.id} in chat {chat_id}."
+        return f"Topic '{title}' created in chat {chat_id}. Use list_topics to retrieve its ID."
+    except Exception as e:
+        return log_and_format_error("create_topic", e, chat_id=chat_id, title=title)
+
+
 class GetForumTopicsRequest(TLRequest):
     """Raw request for channels.getForumTopics missing in Telethon 1.42-1.43."""
 
@@ -189,6 +325,7 @@ async def get_chats(account: Optional[str] = None, page: int = 1, page_size: int
             return "Page out of range."
         chats = dialogs[start:end]
         records = []
+        defaults = {}
         for dialog in chats:
             entity = dialog.entity
             title = getattr(entity, "title", None)
@@ -200,6 +337,12 @@ async def get_chats(account: Optional[str] = None, page: int = 1, page_size: int
                 {
                     "chat_id": get_marked_id(entity),
                     "title": sanitize_name(title),
+                    **await chat_notification_settings(
+                        entity,
+                        cl,
+                        getattr(getattr(dialog, "dialog", None), "notify_settings", None),
+                        defaults,
+                    ),
                 }
             )
         return format_tool_result(records)
@@ -283,8 +426,8 @@ async def list_topics(
         allowed_topics = get_allowed_topics(chat_id, entity)
         if allowed_topics is None:
             result = await cl(
-                GetForumTopicsRequest(
-                    channel=entity,
+                functions.messages.GetForumTopicsRequest(
+                    peer=entity,
                     offset_date=0,
                     offset_id=0,
                     offset_topic=offset_topic,
@@ -794,6 +937,7 @@ async def list_chats(
             )
 
         records = []
+        defaults = {}
         for dialog in dialogs:
             entity = dialog.entity
 
@@ -838,16 +982,8 @@ async def list_chats(
 
             # Extract mute status from notify_settings
             notify_settings = getattr(inner_dialog, "notify_settings", None)
-            mute_until = getattr(notify_settings, "mute_until", None)
-            if mute_until is None:
-                is_muted = False
-            elif isinstance(mute_until, datetime):
-                is_muted = mute_until.timestamp() > time.time()
-            else:
-                is_muted = mute_until > time.time()
-
-            # Filter by mute status if requested
-            if unmuted_only and is_muted:
+            notifications = await chat_notification_settings(entity, cl, notify_settings, defaults)
+            if unmuted_only and notifications["muted"] is not False:
                 continue
 
             # Filter by unread status if requested
@@ -857,7 +993,7 @@ async def list_chats(
             record["unread"] = unread_count
             if unread_mark:
                 record["unread_mark"] = True
-            record["muted"] = is_muted
+            record.update(notifications)
             record["archived"] = bool(getattr(dialog, "archived", False))
 
             # Add unread mentions count if available
@@ -936,6 +1072,7 @@ async def get_chat(chat_id: Union[int, str], account: Optional[str] = None) -> s
             )
 
         record = {"id": get_marked_id(entity)}
+        record.update(await chat_notification_settings(entity, cl))
 
         is_user = isinstance(entity, User)
 
@@ -1551,6 +1688,9 @@ async def get_message_link(
 
 
 __all__ = [
+    "get_chat_notification_settings",
+    "enable_forum",
+    "create_topic",
     "get_chats",
     "list_topics",
     "list_forum_topic_icons",

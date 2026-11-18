@@ -240,8 +240,8 @@ async def test_list_topics_sends_get_forum_topics_request(monkeypatch):
     ]
     assert len(client.requests) == 1
     request = client.requests[0]
-    assert isinstance(request, chats.GetForumTopicsRequest)
-    assert request.channel is entity
+    assert isinstance(request, functions.messages.GetForumTopicsRequest)
+    assert request.peer is entity
     assert request.limit == 50
     assert request.offset_topic == 5
     assert request.q == "Eng"
